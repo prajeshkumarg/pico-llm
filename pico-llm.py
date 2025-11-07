@@ -40,6 +40,8 @@ def parse_args():
 
     parser.add_argument("--block_size", type=int, default=1024,
                         help="Maximum sequence length for each example. Default=1024.")
+    parser.add_argument("--activation", type=str, default="silu",
+                        help="Activation layer to use for MLP model. Default=silu, supported values : [relu,silu,sigmoid, gelu].")
 
     # New arguments:
     parser.add_argument("--embed_size", type=int, default=1024,
@@ -50,6 +52,7 @@ def parse_args():
     # Newly added device argument:
     parser.add_argument("--device_id", type=str, default="cuda:0",
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
+    
 
     args = parser.parse_args()
     return args
@@ -152,17 +155,24 @@ class KGramMLPSeqModel(nn.Module):
     Potentially very large memory usage for big vocab or seq_len. chunk_size helps mitigate overhead.
     """
 
-    def __init__(self, vocab_size, k=3, embed_size=1024, num_inner_layers=1, chunk_size=1):
+    def __init__(self, vocab_size, k=3, embed_size=1024, num_inner_layers=1, chunk_size=1, activation=nn.SiLU):
         super().__init__()
         self.k = k
         self.vocab_size = vocab_size
         self.embed_size = embed_size
         self.num_inner_layers = num_inner_layers
         self.chunk_size = chunk_size
-
         # fill in
-
-        self.net = None
+        self.activation = activation
+        self.net = nn.Sequential(
+            nn.Linear(self.k * self.vocab_size, self.embed_size),
+            self.activation(),
+            *[
+                layer for _ in range(self.num_inner_layers) for layer in (
+                    nn.Linear(self.embed_size, self.embed_size),
+                    self.activation()
+                )],
+                nn.Linear(self.embed_size, self.vocab_size))
 
     def forward(self, tokens_seq):
         """
@@ -426,6 +436,18 @@ def train_one_model(model,
 # 9. Main
 ################################################################################
 
+def return_activation(activation_str):
+    activation_str = activation_str.lower()
+    if activation_str == "relu":
+        return nn.ReLU
+    elif activation_str == "silu":
+        return nn.SiLU
+    elif activation_str == "sigmoid":
+        return nn.Sigmoid
+    elif activation_str == "gelu":
+        return nn.GELU
+    else:
+        raise ValueError(f"Unsupported activation: {activation_str}. Supported: relu, silu, sigmoid, gelu.")
 def main():
     args = parse_args()
 
@@ -446,8 +468,16 @@ def main():
     max_steps_per_epoch = args.max_steps_per_epoch
     num_inner_layers = args.num_inner_mlp_layers
 
+    #newly added local variables
+    activation = args.activation.lower()
+    act = return_activation(activation)
+    
+
+
+
     # NEW: pick device from args.device_id, fallback to cpu if needed
     requested_device_id = args.device_id
+    print(f"Requested device ID: {requested_device_id}")
     if requested_device_id.startswith("cuda") and not torch.cuda.is_available():
         print(f"Requested device '{requested_device_id}' but CUDA not available. Falling back to CPU.")
         device = torch.device("cpu")
@@ -525,7 +555,8 @@ def main():
         k=k,
         embed_size=embed_size,
         num_inner_layers=num_inner_layers,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
+        activation=act
     ).to(device)
 
     lstm_model = LSTMSeqModel(
@@ -538,8 +569,8 @@ def main():
     ).to(device)
 
     models = {
-      # "kgram_mlp_seq": kgram_model,
-        "lstm_seq": lstm_model,
+      "kgram_mlp_seq": kgram_model,
+      #  "lstm_seq": lstm_model,
       # "kvcache_transformer": kv_transformer,
     }
 
@@ -549,6 +580,7 @@ def main():
     ############################################################################
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
+        print(f"Model architecture:\n{model}\n")
         train_one_model(
             model=model,
             loader=train_loader,
