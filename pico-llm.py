@@ -271,7 +271,37 @@ def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5)
 ################################################################################
 
 def nucleus_sampling(logits, p=0.95):
-    return torch.argmax(logits).item()
+    # Convert logits to probabilities
+    prob_dist = torch.softmax(logits, dim=-1)
+
+    # Sort probabilities in descending order and get indices
+    sorted_probs, sorted_indices = torch.sort(prob_dist, descending=True)
+
+    # Compute cumulative sum
+    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Find the cutoff index where cumulative probability exceeds p
+    # We want to include all tokens up to where cumsum first exceeds p
+    cutoff_mask = cumsum_probs <= p
+
+    # Always include at least the first token (highest probability)
+    # This handles edge case where first token alone has prob > p
+    cutoff_mask[0] = True
+
+    # Zero out probabilities beyond the nucleus
+    filtered_probs = sorted_probs.clone()
+    filtered_probs[~cutoff_mask] = 0.0
+
+    # Renormalize the remaining probabilities
+    filtered_probs = filtered_probs / filtered_probs.sum()
+
+    # Sample from the filtered distribution
+    sampled_index = torch.multinomial(filtered_probs, num_samples=1).item()
+
+    # Map back to original token index
+    chosen_token = sorted_indices[sampled_index].item()
+
+    return chosen_token
 
 
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
