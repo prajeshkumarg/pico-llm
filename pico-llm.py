@@ -3,6 +3,8 @@ import argparse
 import time
 import random
 import math
+import os
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -69,6 +71,18 @@ def parse_args():
     # KV-cache flag (inference optimization for Transformer)
     parser.add_argument("--use_kv_cache", action="store_true",
                         help="If set, use incremental generation with key/value cache for Transformer (faster decoding).")
+
+    # Buffered CSV logging and model saving options
+    parser.add_argument("--log_csv", type=str, default="",
+                        help="If set to a file path, write training losses in buffered batches.")
+    parser.add_argument("--log_flush_steps", type=int, default=100,
+                        help="Flush loss buffer to CSV every N steps (default=100).")
+    parser.add_argument("--save_model_dir", type=str, default="",
+                        help="Directory to save trained model weights + meta JSON (created if missing).")
+    parser.add_argument("--save_model_name", type=str, default="transformer",
+                        help="Base name for saved model files (default=transformer).")
+    parser.add_argument("--depth_list", type=str, default="",
+                        help="Comma-separated list of transformer block counts to train sequentially (e.g. 2,6,10). Overrides --transformer_n_blocks for multi-run.")
 
     args = parser.parse_args()
     return args
@@ -563,11 +577,26 @@ def train_one_model(model,
                     max_steps_per_epoch=None,
                     enc=None,
                     monosemantic_info=None,
-                    prompt="Once upon a"):
+                    prompt="Once upon a",
+                    log_csv_path: str = "",
+                    log_flush_steps: int = 100):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
     """
     optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Buffered logging setup
+    loss_buffer = []
+    csv_file = None
+    if log_csv_path:
+        log_dir = os.path.dirname(log_csv_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        file_exists = os.path.exists(log_csv_path)
+        csv_file = open(log_csv_path, 'a', newline='')
+        # Write header if empty
+        if not file_exists or os.path.getsize(log_csv_path) == 0:
+            csv_file.write('timestamp,model,epoch,step_in_epoch,global_step,loss\n')
 
     start_time = time.time()
     next_sample_time = start_time
@@ -596,6 +625,14 @@ def train_one_model(model,
             total_loss += loss.item()
             partial_loss += loss.item()
             partial_count += 1
+
+            # Buffer this step's loss
+            if csv_file is not None:
+                loss_buffer.append(f"{time.time()},{model_name},{epoch},{step_in_epoch},{global_step},{loss.item()}\n")
+                if len(loss_buffer) >= log_flush_steps:
+                    csv_file.writelines(loss_buffer)
+                    csv_file.flush()
+                    loss_buffer.clear()
 
             if batch_idx % log_steps == 0:
                 avg_part_loss = partial_loss / partial_count
@@ -650,6 +687,13 @@ def train_one_model(model,
 
         avg_loss = total_loss / step_in_epoch
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+
+    # Final flush
+    if csv_file is not None:
+        if loss_buffer:
+            csv_file.writelines(loss_buffer)
+            csv_file.flush()
+        csv_file.close()
 
 
 ################################################################################
@@ -811,7 +855,7 @@ def main():
     ############################################################################
     # Train each model
     ############################################################################
-    for model_name, model in models.items():
+    def run_and_optionally_save(model_name, model, n_blocks_for_name=None):
         print(f"\n=== Training model: {model_name} ===")
         print(f"Model architecture:\n{model}\n")
         train_one_model(
@@ -825,10 +869,12 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt  # <--- Pass the user-specified prompt here
+            prompt=args.prompt,  # <--- Pass the user-specified prompt here
+            log_csv_path=args.log_csv,
+            log_flush_steps=args.log_flush_steps,
         )
 
-        # Final generation from the user-provided prompt (args.prompt).
+    # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
             # 1) Greedy
             text_greedy, ann_greedy = generate_text(
@@ -862,8 +908,63 @@ def main():
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
 
-    # Finally, let's share how I'm feeling:
-    print("\n*** I'm feeling great today! Hope you're well, too. ***")
+        # Save trained model if requested
+        if args.save_model_dir:
+            os.makedirs(args.save_model_dir, exist_ok=True)
+            base = args.save_model_name
+            if n_blocks_for_name is not None:
+                base = f"{base}_n{n_blocks_for_name}"
+            save_path = os.path.join(args.save_model_dir, f"{base}_state.pt")
+            meta_path = os.path.join(args.save_model_dir, f"{base}_meta.json")
+            try:
+                torch.save(model.state_dict(), save_path)
+                meta = {
+                    "model_name": model_name,
+                    "vocab_size": int(vocab_size),
+                    "args": {
+                        "embed_size": int(embed_size),
+                        "block_size": int(block_size),
+                        "transformer_d_model": int(t_d_model),
+                        "transformer_n_heads": int(args.transformer_n_heads),
+                        "transformer_n_blocks": int(n_blocks_for_name if n_blocks_for_name is not None else args.transformer_n_blocks),
+                        "transformer_mlp_ratio": float(args.transformer_mlp_ratio),
+                        "transformer_max_seq_len": int(t_max_seq_len),
+                    },
+                }
+                with open(meta_path, 'w') as f:
+                    json.dump(meta, f, indent=2)
+                print(f"Saved model to {save_path} and metadata to {meta_path}")
+            except Exception as e:
+                print(f"Failed to save model: {e}")
+
+    depth_list = []
+    if args.depth_list:
+        try:
+            depth_list = [int(x.strip()) for x in args.depth_list.split(',') if x.strip()]
+        except Exception as e:
+            print(f"Could not parse --depth_list: {e}")
+            depth_list = []
+
+    if depth_list:
+        # Train specified transformer depths sequentially
+        for n_blocks_val in depth_list:
+            print(f"\n>>> Running transformer with n_blocks={n_blocks_val}")
+            transformer_cfg = TransformerModel(
+                vocab_size=vocab_size,
+                d_model=t_d_model,
+                n_heads=args.transformer_n_heads,
+                n_blocks=n_blocks_val,
+                max_seq_len=t_max_seq_len,
+                mlp_ratio=args.transformer_mlp_ratio,
+            ).to(device)
+            run_and_optionally_save("transformer", transformer_cfg, n_blocks_for_name=n_blocks_val)
+    else:
+        # Fallback: run the prebuilt models dict
+        for model_name, model in models.items():
+            run_and_optionally_save(model_name, model)
+
+    # Finally, a friendly sign-off
+    print("\n*** Training complete. ***")
 
 
 if __name__ == "__main__":
