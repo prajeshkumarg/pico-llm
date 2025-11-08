@@ -54,6 +54,22 @@ def parse_args():
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
     
 
+    # Transformer hyperparameters
+    parser.add_argument("--transformer_d_model", type=int, default=None,
+                        help="Transformer model dimension (d_model). Defaults to --embed_size if not set.")
+    parser.add_argument("--transformer_n_heads", type=int, default=8,
+                        help="Number of attention heads in Transformer. Default=8.")
+    parser.add_argument("--transformer_n_blocks", type=int, default=4,
+                        help="Number of Transformer blocks (layers). Default=4.")
+    parser.add_argument("--transformer_mlp_ratio", type=float, default=4.0,
+                        help="Transformer MLP expansion ratio (inner = ratio * d_model). Default=4.0.")
+    parser.add_argument("--transformer_max_seq_len", type=int, default=0,
+                        help="Max sequence length for positional embeddings (0 => use --block_size).")
+
+    # KV-cache flag (inference optimization for Transformer)
+    parser.add_argument("--use_kv_cache", action="store_true",
+                        help="If set, use incremental generation with key/value cache for Transformer (faster decoding).")
+
     args = parser.parse_args()
     return args
 
@@ -244,17 +260,166 @@ class LSTMSeqModel(nn.Module):
 # 5. Our "stub" Transformer with KV-cache 
 #    Very slow Python loop for training. Multi-head sums head outputs.
 ################################################################################
-
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
+    """Root Mean Square Layer Normalization.
+
+    y = weight * (x / sqrt(mean(x^2) + eps)) + bias  (bias optional)
+    We keep bias for flexibility although many implementations omit it.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6, bias: bool = True):
         super().__init__()
-        pass
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.use_bias = bias
+        self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        y = (x / rms) * self.weight
+        if self.use_bias:
+            y = y + self.bias
+        return y
+
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention with optional KV cache.
+    Input x: (T, B, C) -> Output: (T, B, C)
+    If past_kv is provided, it should be a tuple (k_cache, v_cache) of shape (B,H,T_prev,D).
+    Returns (out, new_kv) when caching is used; otherwise returns out.
+    """
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+    def _split_heads(self, t: torch.Tensor, T: int, B: int) -> torch.Tensor:
+        return t.view(T, B, self.n_heads, self.head_dim).permute(1, 2, 0, 3)  # (B,H,T,D)
+
+    def forward(self, x: torch.Tensor, past_kv=None):
+        T, B, C = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = self._split_heads(q, T, B)
+        k = self._split_heads(k, T, B)
+        v = self._split_heads(v, T, B)
+
+        if past_kv is not None:
+            k_cache, v_cache = past_kv
+            if k_cache is not None:
+                k = torch.cat([k_cache, k], dim=2)
+                v = torch.cat([v_cache, v], dim=2)
+
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B,H,T,T_total)
+        # Apply causal mask only when not using cache and sequence length > 1
+        if past_kv is None and T > 1:
+            # Here T_total == T
+            causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+            attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        ctx = torch.matmul(attn_probs, v)  # (B,H,T,D)
+        ctx = ctx.permute(2, 0, 1, 3).contiguous().view(T, B, C)
+        out = self.o_proj(ctx)
+
+        if past_kv is not None:
+            return out, (k, v)
+        else:
+            return out
+
+
+class TransformerBlock(nn.Module):
+    """Single decoder block: RMSNorm -> CausalAttn (residual) -> RMSNorm -> MLP (residual)."""
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_heads)
+        self.mlp_norm = RMSNorm(d_model)
+        inner = int(mlp_ratio * d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, inner, bias=False),
+            nn.SiLU(),
+            nn.Linear(inner, d_model, bias=False),
+        )
+    def forward(self, x: torch.Tensor, past_kv=None):
+        if past_kv is None:
+            x = x + self.attn(self.attn_norm(x))
+        else:
+            attn_out, new_kv = self.attn(self.attn_norm(x), past_kv=past_kv)
+            x = x + attn_out
+        x = x + self.mlp(self.mlp_norm(x))
+        if past_kv is not None:
+            return x, new_kv
+        return x
+
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
-        super().__init__()
+    """Decoder-only causal Transformer producing logits for next-token prediction.
 
-        pass
+    Forward input: tokens_seq (T, B) LongTensor
+    Output: logits (T, B, vocab_size)
+    """
+    def __init__(self,
+                 vocab_size: int = 50257,
+                 d_model: int = 512,
+                 n_heads: int = 8,
+                 n_blocks: int = 6,
+                 max_seq_len: int = 2048,
+                 mlp_ratio: float = 4.0):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+        self.token_embed = nn.Embedding(vocab_size, d_model)
+        self.pos_embed = nn.Embedding(max_seq_len, d_model)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, mlp_ratio) for _ in range(n_blocks)
+        ])
+        self.final_norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # Weight tying (optional; improves parameter efficiency)
+        self.lm_head.weight = self.token_embed.weight
+
+    def forward(self, tokens_seq: torch.Tensor, kv_cache=None):
+        """If kv_cache is provided (list of (k,v)), we perform incremental forward for the new tokens.
+        tokens_seq may be (T,B) full sequence (training) or (1,B) single step (inference).
+        kv_cache: list of tuples per block or None.
+        Returns logits and updated kv_cache when caching.
+        """
+        T, B = tokens_seq.shape
+        if T > self.max_seq_len:
+            tokens_seq = tokens_seq[-self.max_seq_len:]
+            T = tokens_seq.shape[0]
+        # Compute absolute positions; when using cache, continue from cached length
+        if kv_cache is not None and len(kv_cache) > 0 and kv_cache[0][0] is not None:
+            cached_len = kv_cache[0][0].size(2)
+        else:
+            cached_len = 0
+        pos = torch.arange(cached_len, cached_len + T, device=tokens_seq.device)
+        x = self.token_embed(tokens_seq) + self.pos_embed(pos).unsqueeze(1)
+        new_cache = [] if kv_cache is not None else None
+        if kv_cache is None:
+            for blk in self.blocks:
+                x = blk(x)
+        else:
+            # Incremental: assume tokens_seq is last token(s); pass cache per block.
+            for blk, past in zip(self.blocks, kv_cache):
+                x, updated = blk(x, past_kv=past)
+                new_cache.append(updated)
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+        if kv_cache is not None:
+            return logits, new_cache
+        return logits
 
 
 ################################################################################
@@ -307,7 +472,8 @@ def nucleus_sampling(logits, p=0.95):
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
                   top_p=None,
                   monosemantic_info=None,
-                  do_monosemantic=False):
+                  do_monosemantic=False,
+                  use_kv_cache=False):
     """
     A single code path for all models:
       - We keep a growing list 'context_tokens'.
@@ -322,10 +488,31 @@ def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
         context_tokens = enc.encode(init_text)
         annotation_list = []
 
+        kv_cache = None
+
+        # Prime KV cache step-by-step over the initial prompt for strict causality
+        if use_kv_cache and hasattr(model, 'blocks') and len(context_tokens) > 0:
+            kv_cache = [(None, None) for _ in range(len(model.blocks))]
+            for tid in context_tokens:
+                tok = torch.tensor([tid], dtype=torch.long, device=device).unsqueeze(1)  # (1,1)
+                _, kv_cache = model(tok, kv_cache=kv_cache)
+
         for step_i in range(max_new_tokens):
-            seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1)
-            logits_seq = model(seq_tensor)              # (seq_len,1,vocab_size)
-            next_logits = logits_seq[-1, 0, :]         # shape (vocab_size,)
+            if use_kv_cache and hasattr(model, 'blocks'):
+                # Use only the last token and advance cache
+                if len(context_tokens) == 0:
+                    # Fallback: no context, create a space token as a starter
+                    last_id = enc.encode(" ")[-1]
+                else:
+                    last_id = context_tokens[-1]
+                last_token = torch.tensor([last_id], dtype=torch.long, device=device).unsqueeze(1)  # (1,1)
+                logits_seq, kv_cache = model(last_token, kv_cache=kv_cache if kv_cache is not None else [(None, None) for _ in range(len(model.blocks))])
+                next_logits = logits_seq[-1, 0, :]
+            else:
+                # Fallback: full context each step (works for all models)
+                seq_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(1)
+                logits_seq = model(seq_tensor)              # (seq_len,1,vocab_size)
+                next_logits = logits_seq[-1, 0, :]         # shape (vocab_size,)
 
             if top_p is None:
                 # greedy
@@ -425,6 +612,7 @@ def train_one_model(model,
                     text_greedy, ann_greedy = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=None,
+                        use_kv_cache=False,
                         monosemantic_info=monosemantic_info,
                         do_monosemantic=(monosemantic_info is not None)
                     )
@@ -435,6 +623,7 @@ def train_one_model(model,
                     text_topp, ann_topp = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=0.95,
+                        use_kv_cache=False,
                         monosemantic_info=monosemantic_info,
                         do_monosemantic=(monosemantic_info is not None)
                     )
@@ -446,6 +635,7 @@ def train_one_model(model,
                     text_topp1, ann_topp1 = generate_text(
                         model, enc, prompt, max_new_tokens=20, device=device,
                         top_p=1.0,
+                        use_kv_cache=False,
                         monosemantic_info=monosemantic_info,
                         do_monosemantic=(monosemantic_info is not None)
                     )
@@ -595,10 +785,23 @@ def main():
         hidden_size=embed_size
     ).to(device)
 
+    # Resolve Transformer hyperparameters (defaults tied to embed_size/block_size when unspecified)
+    t_d_model = args.transformer_d_model if args.transformer_d_model is not None else embed_size
+    t_max_seq_len = args.transformer_max_seq_len if args.transformer_max_seq_len and args.transformer_max_seq_len > 0 else block_size
+
     transformer = TransformerModel(
+        vocab_size=vocab_size,
+        d_model=t_d_model,
+        n_heads=args.transformer_n_heads,
+        n_blocks=args.transformer_n_blocks,
+        max_seq_len=t_max_seq_len,
+        mlp_ratio=args.transformer_mlp_ratio,
     ).to(device)
 
     models = {
+      # "kgram_mlp_seq": kgram_model,
+        #"lstm_seq": lstm_model,
+        "transformer": transformer,
       "kgram_mlp_seq": kgram_model,
       #  "lstm_seq": lstm_model,
       # "kvcache_transformer": kv_transformer,
@@ -631,16 +834,19 @@ def main():
             text_greedy, ann_greedy = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=None,
+                use_kv_cache=args.use_kv_cache,
             )
             # 2) top-p=0.95
             text_topp, ann_topp = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=0.95,
+                use_kv_cache=args.use_kv_cache,
             )
             # 3) top-p=1.0 => full distribution random sampling
             text_topp1, ann_topp1 = generate_text(
                 model, enc, args.prompt, max_new_tokens=20, device=device,
                 top_p=1.0,
+                use_kv_cache=args.use_kv_cache,
             )
 
         print(f"[{model_name}] Final sample (greedy) from prompt: '{args.prompt}'")
