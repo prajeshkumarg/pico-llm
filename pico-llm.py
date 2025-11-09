@@ -83,12 +83,13 @@ def parse_args():
                         help="Base name for saved model files (default=transformer).")
     parser.add_argument("--depth_list", type=str, default="",
                         help="Comma-separated list of transformer block counts to train sequentially (e.g. 2,6,10). Overrides --transformer_n_blocks for multi-run.")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs.")
 
     args = parser.parse_args()
     return args
 
 
-################################################################################
+##############################################f##################################
 # 2. Data handling: entire sequences up to block_size => (seq_len, batch)
 ################################################################################
 
@@ -721,7 +722,7 @@ def main():
 
     embed_size = args.embed_size
     batch_size = 16
-    num_epochs = 3
+    num_epochs = args.num_epochs
     learning_rate = 1e-3
 
     block_size = args.block_size
@@ -858,6 +859,8 @@ def main():
     def run_and_optionally_save(model_name, model, n_blocks_for_name=None):
         print(f"\n=== Training model: {model_name} ===")
         print(f"Model architecture:\n{model}\n")
+        csv_name = args.log_csv.split('.csv')[0]
+        new_csv_path = f"{csv_name}_{model_name}_{n_blocks_for_name}.csv" if n_blocks_for_name is not None else args.log_csvs
         train_one_model(
             model=model,
             loader=train_loader,
@@ -870,7 +873,7 @@ def main():
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
             prompt=args.prompt,  # <--- Pass the user-specified prompt here
-            log_csv_path=args.log_csv,
+            log_csv_path=new_csv_path,
             log_flush_steps=args.log_flush_steps,
         )
 
