@@ -4,7 +4,7 @@ from sklearn.cluster import KMeans
 import nltk, json, re
 from nltk.corpus import stopwords
 from collections import Counter
-
+#use pip install gensim in colab
 # --- NLTK setup ---
 nltk.download("punkt")
 nltk.download("punkt_tab")
