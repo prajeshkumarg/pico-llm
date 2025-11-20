@@ -16,5 +16,6 @@ build/
 env/
 .runs/
 notebooks/demo-steps/models
-notebooks/demo-steps/saved-models
+notebooks/demo-steps/saved_models/
+notebooks/demo-steps/hyperparam_models/
 
