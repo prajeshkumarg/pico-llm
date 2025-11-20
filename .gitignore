@@ -15,4 +15,6 @@ build/
 .vscode/
 env/
 .runs/
+notebooks/demo-steps/models
+notebooks/demo-steps/saved-models
 
