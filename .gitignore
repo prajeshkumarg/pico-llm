@@ -15,4 +15,4 @@ build/
 .vscode/
 env/
 .runs/
-notebooks/demo-steps/training_logs/
+
